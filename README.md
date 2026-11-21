@@ -72,3 +72,15 @@ PICO OS の `ConfigurationService` の仕様上、`adb install` 直後に `adb s
 ```bash
 adb logcat -s PicoQrReader PicoQrCamera
 ```
+
+## ライセンス
+
+[MIT License](LICENSE)
+
+同梱しているサードパーティのコードは、それぞれのライセンスに従います。
+
+| パス | ライセンス |
+| --- | --- |
+| `third_party/quirc/` | ISC（[LICENSE](third_party/quirc/LICENSE)） |
+| `third_party/openxr/` | Apache-2.0 OR MIT（Khronos Group, PICO 拡張を含む） |
+| `third_party/lib/` | PICO OpenXR SDK 同梱の OpenXR ローダー |
