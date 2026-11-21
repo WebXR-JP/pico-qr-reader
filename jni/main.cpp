@@ -47,6 +47,16 @@ struct Mat4 {
     float m[16];
 };
 
+struct CameraViewMap {
+    GLuint tex = 0;
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float cx = 0.0f;
+    float cy = 0.0f;
+    float imgW = 1280.0f;
+    float imgH = 960.0f;
+};
+
 Mat4 MakeProjection(const XrFovf& fov, float nearZ, float farZ) {
     const float tanLeft = std::tan(fov.angleLeft);
     const float tanRight = std::tan(fov.angleRight);
@@ -111,14 +121,100 @@ Mat4 MulMat4(const Mat4& a, const Mat4& b) {
     return r;
 }
 
-Mat4 MakeTranslateScale(float tx, float ty, float tz, float sx, float sy) {
+struct Vec3 {
+    float x, y, z;
+};
+
+Vec3 RotateVec(const XrQuaternionf& q, const Vec3& v) {
+    // v' = v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)
+    const float tx = 2.0f * (q.y * v.z - q.z * v.y);
+    const float ty = 2.0f * (q.z * v.x - q.x * v.z);
+    const float tz = 2.0f * (q.x * v.y - q.y * v.x);
+    return {
+        v.x + q.w * tx + (q.y * tz - q.z * ty),
+        v.y + q.w * ty + (q.z * tx - q.x * tz),
+        v.z + q.w * tz + (q.x * ty - q.y * tx),
+    };
+}
+
+XrQuaternionf QuatMul(const XrQuaternionf& a, const XrQuaternionf& b) {
+    return {
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+    };
+}
+
+XrQuaternionf QuatFromAxisAngle(float ax, float ay, float az, float angle) {
+    const float h = 0.5f * angle;
+    const float s = std::sin(h);
+    return {ax * s, ay * s, az * s, std::cos(h)};
+}
+
+XrQuaternionf QuatSlerp(const XrQuaternionf& a, const XrQuaternionf& b, float t) {
+    float dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    XrQuaternionf bb = b;
+    if (dot < 0.0f) {
+        dot = -dot;
+        bb = {-b.x, -b.y, -b.z, -b.w};
+    }
+    float wa, wb;
+    if (dot > 0.9995f) {
+        wa = 1.0f - t;
+        wb = t;
+    } else {
+        const float theta = std::acos(dot);
+        const float sinTheta = std::sin(theta);
+        wa = std::sin((1.0f - t) * theta) / sinTheta;
+        wb = std::sin(t * theta) / sinTheta;
+    }
+    XrQuaternionf out{
+        wa * a.x + wb * bb.x,
+        wa * a.y + wb * bb.y,
+        wa * a.z + wb * bb.z,
+        wa * a.w + wb * bb.w,
+    };
+    const float n = std::sqrt(out.x * out.x + out.y * out.y + out.z * out.z + out.w * out.w);
+    if (n > 1e-6f) {
+        out.x /= n; out.y /= n; out.z /= n; out.w /= n;
+    }
+    return out;
+}
+
+// a * b : b is expressed in a's local frame
+XrPosef PoseMul(const XrPosef& a, const XrPosef& b) {
+    const Vec3 p = RotateVec(a.orientation, {b.position.x, b.position.y, b.position.z});
+    XrPosef out;
+    out.orientation = QuatMul(a.orientation, b.orientation);
+    out.position = {a.position.x + p.x, a.position.y + p.y, a.position.z + p.z};
+    return out;
+}
+
+// Model matrix for a quad in the XY plane (facing +Z) placed at `pose`.
+Mat4 MakePoseScale(const XrPosef& pose, float sx, float sy) {
+    const float x = pose.orientation.x;
+    const float y = pose.orientation.y;
+    const float z = pose.orientation.z;
+    const float w = pose.orientation.w;
+
+    const float r00 = 1.0f - 2.0f * (y * y + z * z);
+    const float r01 = 2.0f * (x * y - z * w);
+    const float r02 = 2.0f * (x * z + y * w);
+    const float r10 = 2.0f * (x * y + z * w);
+    const float r11 = 1.0f - 2.0f * (x * x + z * z);
+    const float r12 = 2.0f * (y * z - x * w);
+    const float r20 = 2.0f * (x * z - y * w);
+    const float r21 = 2.0f * (y * z + x * w);
+    const float r22 = 1.0f - 2.0f * (x * x + y * y);
+
     Mat4 m{};
-    m.m[0] = sx;
-    m.m[5] = sy;
-    m.m[10] = 1.0f;
-    m.m[12] = tx;
-    m.m[13] = ty;
-    m.m[14] = tz;
+    m.m[0] = r00 * sx; m.m[1] = r10 * sx; m.m[2] = r20 * sx; m.m[3] = 0.0f;
+    m.m[4] = r01 * sy; m.m[5] = r11 * sy; m.m[6] = r21 * sy; m.m[7] = 0.0f;
+    m.m[8] = r02;      m.m[9] = r12;      m.m[10] = r22;     m.m[11] = 0.0f;
+    m.m[12] = pose.position.x;
+    m.m[13] = pose.position.y;
+    m.m[14] = pose.position.z;
     m.m[15] = 1.0f;
     return m;
 }
@@ -142,33 +238,60 @@ GLuint CreateQuadProgram() {
         layout(location = 0) in vec2 aPos;
         layout(location = 1) in vec2 aUv;
         uniform mat4 uMvp;
+        uniform int uMode;        // 0 = world-space textured quad, 2 = fullscreen camera
+        uniform vec4 uDispTan;    // display FOV tangents: left, right, down, up
+        uniform vec4 uCamFocal;   // camera fx, fy, cx, cy (pixels)
+        uniform vec2 uCamSize;    // camera image size in pixels
         out vec2 vUv;
+        out vec2 vScreen;
         void main() {
-            vUv = aUv;
-            gl_Position = uMvp * vec4(aPos, 0.0, 1.0);
+            if (uMode == 2) {
+                vec2 ndc = aPos * 2.0;
+                // Tangent of the ray direction for this screen position,
+                // using the per-eye asymmetric display FOV.
+                float tx = ndc.x >= 0.0 ? ndc.x * uDispTan.y : ndc.x * (-uDispTan.x);
+                float ty = ndc.y >= 0.0 ? ndc.y * uDispTan.w : ndc.y * (-uDispTan.z);
+                // Pinhole reprojection into the camera image (top-left origin).
+                vec2 uvPx = uCamFocal.zw + vec2(uCamFocal.x * tx, -uCamFocal.y * ty);
+                vUv = uvPx / uCamSize;
+                vScreen = aPos + 0.5;
+                gl_Position = vec4(ndc, 0.0, 1.0);
+            } else {
+                vUv = aUv;
+                vScreen = aPos + 0.5;
+                gl_Position = uMvp * vec4(aPos, 0.0, 1.0);
+            }
         }
     )";
     const char* fs = R"(#version 300 es
+        precision highp int;
         precision mediump float;
         in vec2 vUv;
+        in vec2 vScreen;
         uniform sampler2D uTex;
-        uniform int uMode;      // 0 = HUD texture, 1 = Camera preview with reticle
+        uniform int uMode;        // 0 = HUD texture, 2 = camera passthrough view
         uniform float uDetected;
         out vec4 fragColor;
         void main() {
             vec4 c = texture(uTex, vUv);
-            if (uMode == 1) {
-                // Draw subtle corner reticle + border
-                vec2 d = min(vUv, 1.0 - vUv);
-                float border = step(min(d.x, d.y), 0.012);
-                vec3 frameCol = mix(vec3(0.3, 0.75, 1.0), vec3(0.18, 0.92, 0.5), uDetected);
-                // Center aim box
-                vec2 cd = abs(vUv - vec2(0.5));
-                float inBox = step(max(cd.x, cd.y), 0.28) * (1.0 - step(max(cd.x, cd.y), 0.272));
-                float cornerMask = step(0.16, min(cd.x, cd.y));
-                float reticle = inBox * cornerMask;
-                vec3 outCol = mix(c.rgb, frameCol, clamp(border * 0.85 + reticle * 0.9, 0.0, 1.0));
-                fragColor = vec4(outCol, 0.96);
+            if (uMode == 2) {
+                // The camera FOV is narrower than the display FOV. Rather than
+                // stretching edge texels over the periphery, fade to a dark
+                // vignette at the image boundary.
+                vec2 edge = min(vUv, 1.0 - vUv);
+                float inside = min(edge.x, edge.y);
+                float fade = smoothstep(0.0, 0.10, inside);
+                vec3 dark = vec3(0.012, 0.015, 0.022);
+                c.rgb = mix(dark, c.rgb, fade);
+                // Small, unobtrusive aiming reticle at the center of view.
+                vec2 p = vScreen - 0.5;
+                float crossH = (abs(p.x) < 0.0022 && abs(p.y) < 0.016) ? 1.0 : 0.0;
+                float crossV = (abs(p.y) < 0.0022 && abs(p.x) < 0.016) ? 1.0 : 0.0;
+                float cross = max(crossH, crossV);
+                float dotMask = 1.0 - step(0.0035, length(p));
+                vec3 retCol = mix(vec3(0.65, 0.85, 1.0), vec3(0.2, 0.95, 0.55), uDetected);
+                c.rgb = mix(c.rgb, retCol, clamp(cross * 0.55 + dotMask * 0.85, 0.0, 1.0));
+                fragColor = vec4(c.rgb, 1.0);
             } else {
                 fragColor = c;
             }
@@ -180,6 +303,13 @@ GLuint CreateQuadProgram() {
     glAttachShader(p, v);
     glAttachShader(p, f);
     glLinkProgram(p);
+    GLint linked = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        char log[512];
+        glGetProgramInfoLog(p, sizeof(log), nullptr, log);
+        LOGE("Program link error: %s", log);
+    }
     glDeleteShader(v);
     glDeleteShader(f);
     return p;
@@ -241,7 +371,16 @@ struct JniBridge {
                                   detected ? JNI_TRUE : JNI_FALSE));
         env->DeleteLocalRef(jStatus);
         env->DeleteLocalRef(jQr);
-        if (!arr) return false;
+        if (env->ExceptionCheck()) {
+            LOGE("renderHudBitmap threw an exception");
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            return false;
+        }
+        if (!arr) {
+            LOGE("renderHudBitmap returned null");
+            return false;
+        }
 
         jsize len = env->GetArrayLength(arr);
         if (len >= w * h * 4) {
@@ -496,13 +635,24 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
     }
     LOGI("xrCreateSession succeeded");
 
-    // 7. Reference space (VIEW for head-locked HUD)
+    // 7. Reference space (LOCAL so the HUD can be anchored in the air and
+    //    smoothly trail the head; VIEW would make it rigidly head-locked)
     XrReferenceSpaceCreateInfo spaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
-    spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     spaceInfo.poseInReferenceSpace = {{0, 0, 0, 1}, {0, 0, 0}};
-    XrSpace viewSpace = XR_NULL_HANDLE;
-    xrCreateReferenceSpace(session, &spaceInfo, &viewSpace);
-    LOGI("Step 7 done: viewSpace=%p", (void*)viewSpace);
+    XrSpace worldSpace = XR_NULL_HANDLE;
+    spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    res = xrCreateReferenceSpace(session, &spaceInfo, &worldSpace);
+    if (XR_FAILED(res)) {
+        LOGW("LOCAL reference space failed (%d), trying STAGE", (int)res);
+        spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+        res = xrCreateReferenceSpace(session, &spaceInfo, &worldSpace);
+    }
+    if (XR_FAILED(res)) {
+        LOGW("STAGE reference space failed (%d), falling back to VIEW", (int)res);
+        spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+        res = xrCreateReferenceSpace(session, &spaceInfo, &worldSpace);
+    }
+    LOGI("Step 7 done: worldSpace=%p (type=%d)", (void*)worldSpace, (int)spaceInfo.referenceSpaceType);
 
     // 8. Optional XR_FB_passthrough (initialized once session begins)
     XrPassthroughFB passthrough = XR_NULL_HANDLE;
@@ -591,6 +741,9 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
     GLint locTex = glGetUniformLocation(program, "uTex");
     GLint locMode = glGetUniformLocation(program, "uMode");
     GLint locDetected = glGetUniformLocation(program, "uDetected");
+    GLint locDispTan = glGetUniformLocation(program, "uDispTan");
+    GLint locCamFocal = glGetUniformLocation(program, "uCamFocal");
+    GLint locCamSize = glGetUniformLocation(program, "uCamSize");
 
     const float quadVerts[] = {
         -0.5f, -0.5f, 0.0f, 1.0f,
@@ -612,14 +765,22 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
     glBindVertexArray(0);
 
-    GLuint camTex = 0, hudTex = 0;
-    glGenTextures(1, &camTex);
-    glBindTexture(GL_TEXTURE_2D, camTex);
+    GLuint camTexL = 0, camTexR = 0, hudTex = 0;
+    glGenTextures(1, &camTexL);
+    glBindTexture(GL_TEXTURE_2D, camTexL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     uint32_t darkPx = 0xFF202020;
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &darkPx);
+
+    glGenTextures(1, &camTexR);
+    glBindTexture(GL_TEXTURE_2D, camTexR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &darkPx);
 
     glGenTextures(1, &hudTex);
@@ -628,15 +789,24 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    uint32_t clearPx = 0x00000000;
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &clearPx);
 
     const int kHudW = 1024;
     const int kHudH = 320;
-    uint32_t camTexW = 0, camTexH = 0;
+    uint32_t camTexW_L = 0, camTexH_L = 0;
+    uint32_t camTexW_R = 0, camTexH_R = 0;
+    bool rightFrameSeen = false;
+    XrTime lastCaptureL = 0;
+    XrTime lastCaptureR = 0;
 
-    // 12. PICO Camera + QR Decoder worker
-    PicoCamera picoCam;
-    bool camFnsLoaded = cameraExtEnabled && picoCam.LoadFunctions(instance);
-    LOGI("Step 12 done: entering main loop (camFnsLoaded=%d)", (int)camFnsLoaded);
+    // 12. PICO Camera (stereo pair) + QR Decoder worker
+    PicoCamera picoCamL;
+    PicoCamera picoCamR;
+    bool camFnsLoadedL = cameraExtEnabled && picoCamL.LoadFunctions(instance);
+    bool camFnsLoadedR = cameraExtEnabled && picoCamR.LoadFunctions(instance);
+    LOGI("Step 12 done: entering main loop (camFnsLoaded L=%d R=%d)",
+         (int)camFnsLoadedL, (int)camFnsLoadedR);
     DecoderState decoderState;
     std::thread decoderThread(RunDecoderWorker, &decoderState);
 
@@ -645,10 +815,41 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
     bool lastHudDetected = false;
     auto lastDecodeSubmit = std::chrono::steady_clock::now();
 
+    auto uploadCameraTexture = [](GLuint tex, uint32_t& texWOut, uint32_t& texHOut,
+                                  const uint8_t* rgba, uint32_t w, uint32_t h,
+                                  uint32_t stride, uint32_t bpp) {
+        if (bpp != 4) return;
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(stride / bpp));
+        if (w != texWOut || h != texHOut) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)w, (GLsizei)h, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+            texWOut = w;
+            texHOut = h;
+        } else {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h,
+                            GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        }
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    };
+
     bool sessionBegun = false;
     bool exitLoop = false;
     XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
     bool prevTriggerState = false;
+
+    // Floating HUD: world-anchored target pose relative to the head, with a
+    // damped follow so it drifts behind the view and glides back into place.
+    const float kHudPitch = -14.0f * 3.14159265358979f / 180.0f;
+    const XrPosef kHudOffsetPose = {
+        QuatFromAxisAngle(1.0f, 0.0f, 0.0f, kHudPitch),
+        {0.0f, -0.30f, -1.10f},
+    };
+    const float kHudWidth = 0.72f;
+    const float kHudHeight = 0.225f;
+    XrPosef hudPose{};
+    bool hudPoseInitialized = false;
+    XrTime lastFrameTime = 0;
 
     while (!exitLoop && !gStopRequested.load()) {
         // Poll OpenXR events
@@ -668,7 +869,8 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
                         sessionBegun = true;
                     }
                 } else if (sessionState == XR_SESSION_STATE_STOPPING) {
-                    picoCam.Shutdown();
+                    picoCamL.Shutdown();
+                    picoCamR.Shutdown();
                     if (sessionBegun) {
                         xrEndSession(session);
                         sessionBegun = false;
@@ -705,13 +907,20 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
             }
         }
 
-        // Start camera once session is VISIBLE/FOCUSED and CAMERA permission is granted
-        if (camFnsLoaded &&
-            (sessionState == XR_SESSION_STATE_VISIBLE || sessionState == XR_SESSION_STATE_FOCUSED) &&
-            picoCam.GetState() == PicoCamera::State::Idle) {
-            if (gCameraPermGranted.load() || bridge.HasCameraPermission()) {
-                gCameraPermGranted.store(true);
-                picoCam.Start(instance, session);
+        // Start camera(s) once session is VISIBLE/FOCUSED and CAMERA permission is granted.
+        // Start the left camera first, then bring up the right one so the two
+        // async device/session creations do not race each other.
+        const bool sessionVisible = (sessionState == XR_SESSION_STATE_VISIBLE ||
+                                     sessionState == XR_SESSION_STATE_FOCUSED);
+        if (sessionVisible && (gCameraPermGranted.load() || bridge.HasCameraPermission())) {
+            gCameraPermGranted.store(true);
+            if (camFnsLoadedL && picoCamL.GetState() == PicoCamera::State::Idle) {
+                picoCamL.Start(instance, session, 1);  // RGB left
+            }
+            const bool leftSettled = picoCamL.GetState() == PicoCamera::State::Capturing ||
+                                     picoCamL.GetState() == PicoCamera::State::Error;
+            if (camFnsLoadedR && picoCamR.GetState() == PicoCamera::State::Idle && leftSettled) {
+                picoCamR.Start(instance, session, 2);  // RGB right
             }
         }
 
@@ -746,29 +955,20 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
             }
         }
 
-        // Update camera & upload preview + enqueue grayscale for QR decoder
-        if (camFnsLoaded && picoCam.GetState() != PicoCamera::State::Idle) {
-            static bool loggedFirstFrame = false;
-            picoCam.Update([&](const uint8_t* rgba, uint32_t w, uint32_t h, uint32_t stride, uint32_t bpp) {
-                if (bpp != 4) return;
-                if (!loggedFirstFrame) {
-                    loggedFirstFrame = true;
+        // Update cameras & upload textures; the left camera also feeds the QR decoder
+        if (camFnsLoadedL && picoCamL.GetState() != PicoCamera::State::Idle) {
+            static bool loggedFirstFrameL = false;
+            picoCamL.Update([&](const uint8_t* rgba, uint32_t w, uint32_t h, uint32_t stride, uint32_t bpp, XrTime captureTime) {
+                if (captureTime > 0) lastCaptureL = captureTime;
+                if (!loggedFirstFrameL) {
+                    loggedFirstFrameL = true;
                     const uint8_t* mid = rgba + (size_t)(h / 2) * stride + (size_t)(w / 2) * 4;
-                    LOGI("First camera frame received: %ux%u stride=%u bpp=%u centerRGBA=(%u,%u,%u,%u)",
+                    LOGI("First LEFT camera frame: %ux%u stride=%u bpp=%u centerRGBA=(%u,%u,%u,%u)",
                          w, h, stride, bpp, mid[0], mid[1], mid[2], mid[3]);
                 }
-                glBindTexture(GL_TEXTURE_2D, camTex);
-                glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(stride / bpp));
-                if (w != camTexW || h != camTexH) {
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-                    camTexW = w;
-                    camTexH = h;
-                } else {
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-                }
-                glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+                uploadCameraTexture(camTexL, camTexW_L, camTexH_L, rgba, w, h, stride, bpp);
 
-                // Throttle QR decode to ~8 Hz
+                // Throttle QR decode to ~8 Hz (left camera only)
                 auto now = std::chrono::steady_clock::now();
                 if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastDecodeSubmit).count() >= 120) {
                     std::lock_guard<std::mutex> lk(decoderState.mtx);
@@ -794,6 +994,29 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
             });
         }
 
+        // Right camera upload only (displayed to the right eye)
+        if (camFnsLoadedR && picoCamR.GetState() != PicoCamera::State::Idle) {
+            static bool loggedFirstFrameR = false;
+            picoCamR.Update([&](const uint8_t* rgba, uint32_t w, uint32_t h, uint32_t stride, uint32_t bpp, XrTime captureTime) {
+                if (captureTime > 0) lastCaptureR = captureTime;
+                if (!loggedFirstFrameR) {
+                    loggedFirstFrameR = true;
+                    const uint8_t* mid = rgba + (size_t)(h / 2) * stride + (size_t)(w / 2) * 4;
+                    LOGI("First RIGHT camera frame: %ux%u stride=%u bpp=%u centerRGBA=(%u,%u,%u,%u)",
+                         w, h, stride, bpp, mid[0], mid[1], mid[2], mid[3]);
+                }
+                uploadCameraTexture(camTexR, camTexW_R, camTexH_R, rgba, w, h, stride, bpp);
+                if (w > 0 && h > 0) rightFrameSeen = true;
+
+                static int syncLogs = 0;
+                if (syncLogs < 10 && lastCaptureL > 0 && lastCaptureR > 0) {
+                    syncLogs++;
+                    LOGI("Capture delta L-R = %.2f ms (L-R)",
+                         (double)(lastCaptureL - lastCaptureR) / 1e6);
+                }
+            });
+        }
+
         // Check decoded QR status & update HUD texture if changed
         std::string curStatus;
         if (!cameraExtEnabled) {
@@ -801,7 +1024,12 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
         } else if (!gCameraPermGranted.load()) {
             curStatus = "カメラ権限を許可してください";
         } else {
-            curStatus = picoCam.GetStatusText();
+            curStatus = picoCamL.GetStatusText();
+            if (picoCamR.GetState() == PicoCamera::State::Capturing && rightFrameSeen) {
+                curStatus += "  |  ステレオ (L/R)";
+            } else if (picoCamR.GetState() == PicoCamera::State::Error) {
+                curStatus += "  |  右カメラ未使用";
+            }
         }
 
         std::string curQr;
@@ -825,7 +1053,13 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
         }
 
         if (curStatus != lastHudStatus || curQr != lastHudQr || recentlyDetected != lastHudDetected) {
-            bridge.RenderHudToTexture(hudTex, kHudW, kHudH, curStatus, curQr, IsUrl(curQr), recentlyDetected);
+            bool hudOk = bridge.RenderHudToTexture(hudTex, kHudW, kHudH, curStatus, curQr, IsUrl(curQr), recentlyDetected);
+            static int hudUpdateLogs = 0;
+            if (hudUpdateLogs < 3) {
+                hudUpdateLogs++;
+                LOGI("HUD update: ok=%d status='%s' qrLen=%zu", (int)hudOk,
+                     curStatus.c_str(), curQr.size());
+            }
             lastHudStatus = curStatus;
             lastHudQr = curQr;
             lastHudDetected = recentlyDetected;
@@ -848,13 +1082,123 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
             XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
             locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
             locateInfo.displayTime = frameState.predictedDisplayTime;
-            locateInfo.space = viewSpace;
+            locateInfo.space = worldSpace;
 
             XrViewState viewState{XR_TYPE_VIEW_STATE};
             std::vector<XrView> views(viewCount, {XR_TYPE_VIEW});
             uint32_t outViews = 0;
             if (XR_SUCCEEDED(xrLocateViews(session, &locateInfo, &viewState, viewCount, &outViews, views.data()))) {
                 rendered = true;
+                {
+                    static bool loggedEyeFov = false;
+                    if (!loggedEyeFov && outViews > 0) {
+                        loggedEyeFov = true;
+                        LOGI("Eye FOV deg: L=%.1f R=%.1f D=%.1f U=%.1f",
+                             views[0].fov.angleLeft * 57.29578f,
+                             views[0].fov.angleRight * 57.29578f,
+                             views[0].fov.angleDown * 57.29578f,
+                             views[0].fov.angleUp * 57.29578f);
+                    }
+                }
+
+                // ---- Map display rays into each camera image (pinhole reprojection) ----
+                const float kPi = 3.14159265358979f;
+                auto makeCameraMap = [&](const PicoCamera& cam, GLuint tex,
+                                         uint32_t texW, uint32_t texH) {
+                    CameraViewMap m;
+                    m.tex = tex;
+                    m.imgW = texW > 0 ? (float)texW
+                           : (cam.GetWidth() > 0 ? (float)cam.GetWidth() : 1280.0f);
+                    m.imgH = texH > 0 ? (float)texH
+                           : (cam.GetHeight() > 0 ? (float)cam.GetHeight() : 960.0f);
+
+                    const PicoCamera::Intrinsics& ci = cam.GetIntrinsics();
+                    bool valid = false;
+                    if (ci.valid) {
+                        const float kx = (texW > 0 && ci.width > 0)
+                                       ? (float)texW / (float)ci.width : 1.0f;
+                        const float ky = (texH > 0 && ci.height > 0)
+                                       ? (float)texH / (float)ci.height : 1.0f;
+                        m.fx = ci.fx * kx;
+                        m.fy = ci.fy * ky;
+                        m.cx = ci.cx * kx;
+                        m.cy = ci.cy * ky;
+                        if ((m.fx < 1.0f || m.fy < 1.0f) && ci.fovX > 0.0f && ci.fovY > 0.0f) {
+                            // Some runtimes only fill in the FOV (degrees).
+                            m.fx = m.imgW * 0.5f / std::tan(ci.fovX * kPi / 360.0f);
+                            m.fy = m.imgH * 0.5f / std::tan(ci.fovY * kPi / 360.0f);
+                        }
+                        if (m.cx <= 0.0f || m.cy <= 0.0f) {
+                            m.cx = m.imgW * 0.5f;
+                            m.cy = m.imgH * 0.5f;
+                        }
+                        valid = m.fx > 1.0f && m.fy > 1.0f;
+                    }
+                    if (!valid) {
+                        // Fallback: ~100 deg horizontal pinhole, square pixels.
+                        const float hfov = 100.0f * kPi / 180.0f;
+                        m.fx = m.imgW * 0.5f / std::tan(hfov * 0.5f);
+                        m.fy = m.fx;
+                        m.cx = m.imgW * 0.5f;
+                        m.cy = m.imgH * 0.5f;
+                    }
+                    return m;
+                };
+
+                const CameraViewMap mapL = makeCameraMap(picoCamL, camTexL, camTexW_L, camTexH_L);
+                const CameraViewMap mapR = makeCameraMap(picoCamR, camTexR, camTexW_R, camTexH_R);
+                const bool stereoReady =
+                    rightFrameSeen && picoCamR.GetState() == PicoCamera::State::Capturing;
+
+                // Identify which view index is the right eye (view positions are
+                // in LOCAL space, +X = right).
+                uint32_t rightEyeView = 1;
+                if (outViews >= 2 && views[0].pose.position.x > views[1].pose.position.x) {
+                    rightEyeView = 0;
+                }
+                if (stereoReady) {
+                    static bool loggedStereo = false;
+                    if (!loggedStereo) {
+                        loggedStereo = true;
+                        LOGI("Stereo passthrough enabled: L map fx=%.1f R map fx=%.1f (rightView=%u)",
+                             mapL.fx, mapR.fx, rightEyeView);
+                    }
+                }
+
+                // ---- Head pose + damped floating HUD pose ----
+                XrPosef headPose = views[0].pose;
+                if (outViews > 1) {
+                    float px = 0.0f, py = 0.0f, pz = 0.0f;
+                    for (uint32_t i = 0; i < outViews; ++i) {
+                        px += views[i].pose.position.x;
+                        py += views[i].pose.position.y;
+                        pz += views[i].pose.position.z;
+                    }
+                    const float inv = 1.0f / (float)outViews;
+                    headPose.position = {px * inv, py * inv, pz * inv};
+                }
+                const XrPosef hudTarget = PoseMul(headPose, kHudOffsetPose);
+
+                float dt = 0.0f;
+                if (lastFrameTime != 0 && frameState.predictedDisplayTime > lastFrameTime) {
+                    dt = (float)(frameState.predictedDisplayTime - lastFrameTime) * 1e-9f;
+                }
+                lastFrameTime = frameState.predictedDisplayTime;
+                if (dt < 0.0f) dt = 0.0f;
+                if (dt > 0.05f) dt = 0.05f;
+
+                if (!hudPoseInitialized) {
+                    hudPose = hudTarget;
+                    hudPoseInitialized = true;
+                } else if (dt > 0.0f) {
+                    const float kFollowTau = 0.16f;  // larger = lazier follow
+                    const float k = 1.0f - std::exp(-dt / kFollowTau);
+                    hudPose.position.x += (hudTarget.position.x - hudPose.position.x) * k;
+                    hudPose.position.y += (hudTarget.position.y - hudPose.position.y) * k;
+                    hudPose.position.z += (hudTarget.position.z - hudPose.position.z) * k;
+                    hudPose.orientation = QuatSlerp(hudPose.orientation, hudTarget.orientation, k);
+                }
+
                 for (uint32_t i = 0; i < viewCount; ++i) {
                     uint32_t imgIdx = 0;
                     XrSwapchainImageAcquireInfo acq{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -862,7 +1206,6 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
                     XrSwapchainImageWaitInfo waitImg{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
                     waitImg.timeout = XR_INFINITE_DURATION;
                     xrWaitSwapchainImage(swapchains[i], &waitImg);
-
                     const int w = (int)viewConfigs[i].recommendedImageRectWidth;
                     const int h = (int)viewConfigs[i].recommendedImageRectHeight;
 
@@ -878,7 +1221,7 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
                     if (passthroughLayer != XR_NULL_HANDLE) {
                         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
                     } else {
-                        glClearColor(0.06f, 0.08f, 0.12f, 1.0f);
+                        glClearColor(0.02f, 0.025f, 0.035f, 1.0f);
                     }
                     glClear(GL_COLOR_BUFFER_BIT);
 
@@ -891,19 +1234,25 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
                     glActiveTexture(GL_TEXTURE0);
                     glUniform1i(locTex, 0);
 
-                    // 1) Camera preview quad (aspect-corrected)
-                    float camAspect = (camTexW > 0 && camTexH > 0) ? ((float)camTexW / (float)camTexH) : (4.0f / 3.0f);
-                    float previewH = 0.44f;
-                    float previewW = previewH * camAspect;
-                    Mat4 mCam = MulMat4(vp, MakeTranslateScale(0.0f, 0.08f, -1.25f, previewW, previewH));
-                    glUniformMatrix4fv(locMvp, 1, GL_FALSE, mCam.m);
-                    glUniform1i(locMode, 1);
+                    // 1) Full-FOV camera feed, reprojected from the camera's
+                    //    pinhole intrinsics into this eye's display FOV.
+                    //    In stereo mode the right eye gets the right RGB camera.
+                    const bool useRightCamera = stereoReady && i == rightEyeView;
+                    const CameraViewMap& cm = useRightCamera ? mapR : mapL;
+                    glUniform4f(locDispTan,
+                                std::tan(views[i].fov.angleLeft),
+                                std::tan(views[i].fov.angleRight),
+                                std::tan(views[i].fov.angleDown),
+                                std::tan(views[i].fov.angleUp));
+                    glUniform4f(locCamFocal, cm.fx, cm.fy, cm.cx, cm.cy);
+                    glUniform2f(locCamSize, cm.imgW, cm.imgH);
                     glUniform1f(locDetected, recentlyDetected ? 1.0f : 0.0f);
-                    glBindTexture(GL_TEXTURE_2D, camTex);
+                    glUniform1i(locMode, 2);
+                    glBindTexture(GL_TEXTURE_2D, cm.tex);
                     glDrawArrays(GL_TRIANGLES, 0, 6);
 
-                    // 2) HUD text panel quad
-                    Mat4 mHud = MulMat4(vp, MakeTranslateScale(0.0f, -0.30f, -1.25f, 0.72f, 0.225f));
+                    // 2) Floating HUD text panel (world space, damped follow)
+                    Mat4 mHud = MulMat4(vp, MakePoseScale(hudPose, kHudWidth, kHudHeight));
                     glUniformMatrix4fv(locMvp, 1, GL_FALSE, mHud.m);
                     glUniform1i(locMode, 0);
                     glBindTexture(GL_TEXTURE_2D, hudTex);
@@ -936,7 +1285,7 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
         XrCompositionLayerProjection projLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         if (rendered) {
             projLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-            projLayer.space = viewSpace;
+            projLayer.space = worldSpace;
             projLayer.viewCount = viewCount;
             projLayer.views = projViews.data();
             layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projLayer));
@@ -947,7 +1296,14 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
         endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
         endInfo.layerCount = (uint32_t)layers.size();
         endInfo.layers = layers.empty() ? nullptr : layers.data();
-        xrEndFrame(session, &endInfo);
+        XrResult endRes = xrEndFrame(session, &endInfo);
+        if (XR_FAILED(endRes)) {
+            static int endFrameErrLogs = 0;
+            if (endFrameErrLogs < 3) {
+                endFrameErrLogs++;
+                LOGE("xrEndFrame failed: %d", (int)endRes);
+            }
+        }
     }
 
     // Cleanup
@@ -957,18 +1313,20 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
     }
     if (decoderThread.joinable()) decoderThread.join();
 
-    picoCam.Shutdown();
+    picoCamL.Shutdown();
+    picoCamR.Shutdown();
     if (passthroughLayer != XR_NULL_HANDLE && pfnDestroyPTLayer) pfnDestroyPTLayer(passthroughLayer);
     if (passthrough != XR_NULL_HANDLE && pfnDestroyPT) pfnDestroyPT(passthrough);
     for (auto sc : swapchains) {
         if (sc != XR_NULL_HANDLE) xrDestroySwapchain(sc);
     }
-    if (viewSpace != XR_NULL_HANDLE) xrDestroySpace(viewSpace);
+    if (worldSpace != XR_NULL_HANDLE) xrDestroySpace(worldSpace);
     if (actionSet != XR_NULL_HANDLE) xrDestroyActionSet(actionSet);
     if (session != XR_NULL_HANDLE) xrDestroySession(session);
     if (instance != XR_NULL_HANDLE) xrDestroyInstance(instance);
 
-    glDeleteTextures(1, &camTex);
+    glDeleteTextures(1, &camTexL);
+    glDeleteTextures(1, &camTexR);
     glDeleteTextures(1, &hudTex);
     glDeleteProgram(program);
     glDeleteVertexArrays(1, &vao);

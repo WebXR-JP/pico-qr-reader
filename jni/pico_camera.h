@@ -28,23 +28,42 @@ public:
         uint32_t width,
         uint32_t height,
         uint32_t stride,
-        uint32_t bytesPerPixel)>;
+        uint32_t bytesPerPixel,
+        XrTime captureTime)>;
+
+    // Pinhole intrinsics of the active capture stream. Used to reproject the
+    // camera image across the full display FOV instead of showing it as a flat
+    // floating rectangle.
+    struct Intrinsics {
+        bool valid = false;
+        float fx = 0.0f;
+        float fy = 0.0f;
+        float cx = 0.0f;
+        float cy = 0.0f;
+        float fovX = 0.0f;  // degrees
+        float fovY = 0.0f;  // degrees
+        uint32_t width = 0;
+        uint32_t height = 0;
+    };
 
     PicoCamera() = default;
     ~PicoCamera() { Shutdown(); }
 
     bool LoadFunctions(XrInstance instance);
-    bool Start(XrInstance instance, XrSession session);
+    bool Start(XrInstance instance, XrSession session, XrCameraIdPICO preferredCameraId = 0);
     void Update(const FrameCallback& onFrame);
     void Shutdown();
 
     State GetState() const { return state_; }
+    XrCameraIdPICO GetCameraId() const { return cameraId_; }
     std::string GetStatusText() const { return statusText_; }
     uint32_t GetWidth() const { return chosenWidth_; }
     uint32_t GetHeight() const { return chosenHeight_; }
+    const Intrinsics& GetIntrinsics() const { return intrinsics_; }
 
 private:
     bool QueryAndPickConfig();
+    void QueryIntrinsics();
 
     XrInstance instance_ = XR_NULL_HANDLE;
     XrSession session_ = XR_NULL_HANDLE;
@@ -53,9 +72,12 @@ private:
     std::string statusText_ = "待機中";
 
     XrCameraIdPICO cameraId_ = 0;
+    XrCameraIdPICO preferredCameraId_ = 0;
     uint32_t chosenWidth_ = 0;
     uint32_t chosenHeight_ = 0;
     XrCameraImageFpsPICO chosenFps_ = XR_CAMERA_IMAGE_FPS_30_PICO;
+
+    Intrinsics intrinsics_;
 
     XrFutureEXT deviceFuture_ = XR_NULL_FUTURE_EXT;
     XrCameraDevicePICO cameraDevice_ = XR_NULL_HANDLE;
@@ -83,4 +105,7 @@ private:
     PFN_xrAcquireCameraImagePICO xrAcquireCameraImagePICO_ = nullptr;
     PFN_xrGetCameraImageDataPICO xrGetCameraImageDataPICO_ = nullptr;
     PFN_xrReleaseCameraImagePICO xrReleaseCameraImagePICO_ = nullptr;
+    // Optional: not present on every runtime version.
+    PFN_xrGetCameraIntrinsicsPICO xrGetCameraIntrinsicsPICO_ = nullptr;
+    PFN_xrGetCameraExtrinsicsPICO xrGetCameraExtrinsicsPICO_ = nullptr;
 };

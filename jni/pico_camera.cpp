@@ -33,8 +33,59 @@ bool PicoCamera::LoadFunctions(XrInstance instance) {
     LOAD_XR_FN(instance, xrAcquireCameraImagePICO);
     LOAD_XR_FN(instance, xrGetCameraImageDataPICO);
     LOAD_XR_FN(instance, xrReleaseCameraImagePICO);
-    LOGI("All XR_PICO_camera_image functions loaded");
+
+    // Optional calibration queries (may be missing on some runtime versions).
+    xrGetInstanceProcAddr(instance, "xrGetCameraIntrinsicsPICO",
+                          reinterpret_cast<PFN_xrVoidFunction*>(&xrGetCameraIntrinsicsPICO_));
+    xrGetInstanceProcAddr(instance, "xrGetCameraExtrinsicsPICO",
+                          reinterpret_cast<PFN_xrVoidFunction*>(&xrGetCameraExtrinsicsPICO_));
+    LOGI("All XR_PICO_camera_image functions loaded (intrinsics=%d extrinsics=%d)",
+         (int)(xrGetCameraIntrinsicsPICO_ != nullptr),
+         (int)(xrGetCameraExtrinsicsPICO_ != nullptr));
     return true;
+}
+
+void PicoCamera::QueryIntrinsics() {
+    intrinsics_ = {};
+    if (!xrGetCameraIntrinsicsPICO_ || captureSession_ == XR_NULL_HANDLE) {
+        LOGW("Camera intrinsics unavailable; renderer will use a fallback FOV");
+        return;
+    }
+
+    XrCameraIntrinsicsPICO in{XR_TYPE_CAMERA_INTRINSICS_PICO};
+    XrResult res = xrGetCameraIntrinsicsPICO_(captureSession_, &in);
+    if (XR_FAILED(res)) {
+        LOGW("xrGetCameraIntrinsicsPICO failed: %d", (int)res);
+        return;
+    }
+
+    LOGI("Camera intrinsics: focal=(%.2f, %.2f) principal=(%.2f, %.2f) fov=(%.2f, %.2f) deg",
+         in.focalLength.x, in.focalLength.y,
+         in.principalPoint.x, in.principalPoint.y,
+         in.fov.x, in.fov.y);
+
+    intrinsics_.valid = true;
+    intrinsics_.fx = in.focalLength.x;
+    intrinsics_.fy = in.focalLength.y;
+    intrinsics_.cx = in.principalPoint.x;
+    intrinsics_.cy = in.principalPoint.y;
+    intrinsics_.fovX = in.fov.x;
+    intrinsics_.fovY = in.fov.y;
+    intrinsics_.width = chosenWidth_;
+    intrinsics_.height = chosenHeight_;
+
+    if (xrGetCameraExtrinsicsPICO_) {
+        XrCameraExtrinsicsPICO ex{XR_TYPE_CAMERA_EXTRINSICS_PICO};
+        XrResult exRes = xrGetCameraExtrinsicsPICO_(captureSession_, &ex);
+        if (XR_SUCCEEDED(exRes)) {
+            LOGI("Camera extrinsics: pos=(%.3f, %.3f, %.3f) quat=(%.3f, %.3f, %.3f, %.3f)",
+                 ex.pose.position.x, ex.pose.position.y, ex.pose.position.z,
+                 ex.pose.orientation.x, ex.pose.orientation.y,
+                 ex.pose.orientation.z, ex.pose.orientation.w);
+        } else {
+            LOGW("xrGetCameraExtrinsicsPICO failed: %d", (int)exRes);
+        }
+    }
 }
 
 bool PicoCamera::QueryAndPickConfig() {
@@ -58,11 +109,31 @@ bool PicoCamera::QueryAndPickConfig() {
     cameraId_ = camIds[0];
     for (uint32_t i = 0; i < camCount; ++i) {
         LOGI("Available camera[%u]: id=%llu", i, (unsigned long long)camIds[i]);
-        if (camIds[i] == 1) {
-            cameraId_ = camIds[i]; // Prefer RGB Left (id=1)
+    }
+    if (preferredCameraId_ != 0) {
+        bool found = false;
+        for (uint32_t i = 0; i < camCount; ++i) {
+            if (camIds[i] == preferredCameraId_) {
+                cameraId_ = camIds[i];
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            LOGE("Preferred camera id=%llu not found",
+                 (unsigned long long)preferredCameraId_);
+            statusText_ = "カメラID " + std::to_string((unsigned long long)preferredCameraId_) + " が見つかりません";
+            return false;
+        }
+    } else {
+        for (uint32_t i = 0; i < camCount; ++i) {
+            if (camIds[i] == 1) {
+                cameraId_ = camIds[i]; // Prefer RGB Left (id=1)
+            }
         }
     }
-    LOGI("Selected camera id=%llu", (unsigned long long)cameraId_);
+    LOGI("Selected camera id=%llu (preferred=%llu)",
+         (unsigned long long)cameraId_, (unsigned long long)preferredCameraId_);
 
     // Query supported resolutions and FPS
     XrCameraSupportedCapabilitiesGetInfoPICO capGetInfo{XR_TYPE_CAMERA_SUPPORTED_CAPABILITIES_GET_INFO_PICO};
@@ -129,12 +200,13 @@ bool PicoCamera::QueryAndPickConfig() {
     return true;
 }
 
-bool PicoCamera::Start(XrInstance instance, XrSession session) {
+bool PicoCamera::Start(XrInstance instance, XrSession session, XrCameraIdPICO preferredCameraId) {
     if (state_ != State::Idle && state_ != State::Error) {
         return true;
     }
     instance_ = instance;
     session_ = session;
+    preferredCameraId_ = preferredCameraId;
 
     if (!QueryAndPickConfig()) {
         state_ = State::Error;
@@ -240,6 +312,8 @@ void PicoCamera::Update(const FrameCallback& onFrame) {
             captureSession_ = completion.captureSession;
             LOGI("Capture session created: %p", (void*)captureSession_);
 
+            QueryIntrinsics();
+
             XrCameraCaptureBeginInfoPICO beginInfo{XR_TYPE_CAMERA_CAPTURE_BEGIN_INFO_PICO};
             res = xrBeginCameraCapturePICO_(captureSession_, &beginInfo);
             if (XR_FAILED(res)) {
@@ -281,7 +355,8 @@ void PicoCamera::Update(const FrameCallback& onFrame) {
             reinterpret_cast<XrCameraImageDataBaseHeaderPICO*>(&rawBuf));
         if (XR_SUCCEEDED(res) && rawBuf.buffer != nullptr && rawBuf.width > 0 && rawBuf.height > 0) {
             if (onFrame) {
-                onFrame(rawBuf.buffer, rawBuf.width, rawBuf.height, rawBuf.stride, rawBuf.bytesPerPixel);
+                onFrame(rawBuf.buffer, rawBuf.width, rawBuf.height, rawBuf.stride,
+                        rawBuf.bytesPerPixel, img.captureTime);
             }
         }
         xrReleaseCameraImagePICO_(captureSession_, img.imageId);
@@ -303,4 +378,5 @@ void PicoCamera::Shutdown() {
     }
     state_ = State::Idle;
     lastCaptureTime_ = 0;
+    intrinsics_ = {};
 }
