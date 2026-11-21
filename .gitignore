@@ -1,5 +1,22 @@
+# Gradle / Android
+.gradle/
 build/
+.cxx/
+.kotlin/
+local.properties
+captures/
 *.apk
+*.aab
 *.idsig
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Signing keys
 *.keystore
+*.jks
+
+# OS
 .DS_Store

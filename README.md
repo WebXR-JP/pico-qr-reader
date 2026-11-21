@@ -15,15 +15,53 @@ PICO 4 Ultra（PICO OS 5.15.0+）の OpenXR 拡張 **`XR_PICO_camera_image`** �
 
 ## ビルド・インストール
 
-```bash
-# ビルドのみ
-./build.sh
+Gradle（Android Gradle Plugin）+ CMake 構成です。
 
-# ビルド + USB接続中の PICO 4 Ultra へインストール + CAMERA権限付与
-./build.sh install
+### 必要なもの
+
+- JDK 17 以上
+- Android SDK（`ANDROID_HOME` 環境変数、または `local.properties` の `sdk.dir` で指定）
+  - NDK と CMake は `app/build.gradle.kts` で固定したバージョンが初回ビルド時に自動ダウンロードされます（SDK ライセンスへの同意が必要: `sdkmanager --licenses`）
+
+### コマンド
+
+```bash
+./gradlew assembleDebug
 ```
 
-生成物: `build/pico-qr-reader.apk`
+```bash
+./gradlew installDebug
+```
+
+```bash
+adb shell pm grant dev.pico.qrreader android.permission.CAMERA
+```
+
+生成物: `app/build/outputs/apk/debug/pico-qr-reader-debug.apk`
+
+### 構成
+
+| パス | 内容 |
+| --- | --- |
+| `app/src/main/java/` | `MainActivity`（JNI ホスト、クリップボード / URL / HUD ビットマップ描画） |
+| `app/src/main/cpp/` | ネイティブ本体（OpenXR ループ、`XR_PICO_camera_image`）と `CMakeLists.txt` |
+| `third_party/quirc/` | QR デコーダ（静的ライブラリとしてビルド） |
+| `third_party/openxr/`, `third_party/lib/` | **PICO OpenXR SDK** のヘッダーとローダー。PICO 独自拡張を含むため Khronos 版 AAR では置き換え不可 |
+
+### CI / リリース
+
+GitHub Actions（`.github/workflows/build.yml`）で push / PR ごとに debug・release ビルドと lint を実行し、debug APK を artifact としてアップロードします。
+
+`v*` タグを push すると署名済み release APK をビルドして GitHub Release に添付します。リポジトリに次の Secrets が必要です。
+
+| Secret | 内容 |
+| --- | --- |
+| `RELEASE_KEYSTORE_BASE64` | keystore ファイルを `base64 -w0` したもの |
+| `RELEASE_KEYSTORE_PASSWORD` | keystore のパスワード |
+| `RELEASE_KEY_ALIAS` | 鍵のエイリアス |
+| `RELEASE_KEY_PASSWORD` | 鍵のパスワード |
+
+ローカルでも同名の環境変数（`RELEASE_KEYSTORE_PATH` に keystore のパス）を設定すれば `./gradlew assembleRelease` で署名済み APK を作れます。未設定の場合は未署名 APK になります。
 
 ## 初回起動時の注意（PICO OS の仕様）
 
