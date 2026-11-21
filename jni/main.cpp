@@ -47,16 +47,6 @@ struct Mat4 {
     float m[16];
 };
 
-struct CameraViewMap {
-    GLuint tex = 0;
-    float fx = 0.0f;
-    float fy = 0.0f;
-    float cx = 0.0f;
-    float cy = 0.0f;
-    float imgW = 1280.0f;
-    float imgH = 960.0f;
-};
-
 Mat4 MakeProjection(const XrFovf& fov, float nearZ, float farZ) {
     const float tanLeft = std::tan(fov.angleLeft);
     const float tanRight = std::tan(fov.angleRight);
@@ -238,29 +228,14 @@ GLuint CreateQuadProgram() {
         layout(location = 0) in vec2 aPos;
         layout(location = 1) in vec2 aUv;
         uniform mat4 uMvp;
-        uniform int uMode;        // 0 = world-space textured quad, 2 = fullscreen camera
-        uniform vec4 uDispTan;    // display FOV tangents: left, right, down, up
-        uniform vec4 uCamFocal;   // camera fx, fy, cx, cy (pixels)
-        uniform vec2 uCamSize;    // camera image size in pixels
+        uniform int uMode;        // 0 = world-space HUD quad, 1 = fullscreen reticle
         out vec2 vUv;
         out vec2 vScreen;
         void main() {
-            if (uMode == 2) {
-                vec2 ndc = aPos * 2.0;
-                // Tangent of the ray direction for this screen position,
-                // using the per-eye asymmetric display FOV.
-                float tx = ndc.x >= 0.0 ? ndc.x * uDispTan.y : ndc.x * (-uDispTan.x);
-                float ty = ndc.y >= 0.0 ? ndc.y * uDispTan.w : ndc.y * (-uDispTan.z);
-                // Pinhole reprojection into the camera image (top-left origin).
-                vec2 uvPx = uCamFocal.zw + vec2(uCamFocal.x * tx, -uCamFocal.y * ty);
-                vUv = uvPx / uCamSize;
-                vScreen = aPos + 0.5;
-                gl_Position = vec4(ndc, 0.0, 1.0);
-            } else {
-                vUv = aUv;
-                vScreen = aPos + 0.5;
-                gl_Position = uMvp * vec4(aPos, 0.0, 1.0);
-            }
+            vUv = aUv;
+            vScreen = aPos + 0.5;
+            gl_Position = uMode == 1 ? vec4(aPos * 2.0, 0.0, 1.0)
+                                     : uMvp * vec4(aPos, 0.0, 1.0);
         }
     )";
     const char* fs = R"(#version 300 es
@@ -269,31 +244,24 @@ GLuint CreateQuadProgram() {
         in vec2 vUv;
         in vec2 vScreen;
         uniform sampler2D uTex;
-        uniform int uMode;        // 0 = HUD texture, 2 = camera passthrough view
+        uniform int uMode;        // 0 = HUD texture, 1 = reticle
         uniform float uDetected;
         out vec4 fragColor;
         void main() {
-            vec4 c = texture(uTex, vUv);
-            if (uMode == 2) {
-                // The camera FOV is narrower than the display FOV. Rather than
-                // stretching edge texels over the periphery, fade to a dark
-                // vignette at the image boundary.
-                vec2 edge = min(vUv, 1.0 - vUv);
-                float inside = min(edge.x, edge.y);
-                float fade = smoothstep(0.0, 0.10, inside);
-                vec3 dark = vec3(0.012, 0.015, 0.022);
-                c.rgb = mix(dark, c.rgb, fade);
+            if (uMode == 1) {
                 // Small, unobtrusive aiming reticle at the center of view.
+                // Output is premultiplied and transparent elsewhere, so the
+                // system passthrough shows through.
                 vec2 p = vScreen - 0.5;
                 float crossH = (abs(p.x) < 0.0022 && abs(p.y) < 0.016) ? 1.0 : 0.0;
                 float crossV = (abs(p.y) < 0.0022 && abs(p.x) < 0.016) ? 1.0 : 0.0;
                 float cross = max(crossH, crossV);
                 float dotMask = 1.0 - step(0.0035, length(p));
                 vec3 retCol = mix(vec3(0.65, 0.85, 1.0), vec3(0.2, 0.95, 0.55), uDetected);
-                c.rgb = mix(c.rgb, retCol, clamp(cross * 0.55 + dotMask * 0.85, 0.0, 1.0));
-                fragColor = vec4(c.rgb, 1.0);
+                float retA = clamp(cross * 0.55 + dotMask * 0.85, 0.0, 1.0);
+                fragColor = vec4(retCol * retA, retA);
             } else {
-                fragColor = c;
+                fragColor = texture(uTex, vUv);
             }
         }
     )";
@@ -521,9 +489,6 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
     const bool hasPicoCamera = hasExt(XR_PICO_CAMERA_IMAGE_EXTENSION_NAME);
     const bool hasExtFuture = hasExt(XR_EXT_FUTURE_EXTENSION_NAME);
     const bool hasCameraExt = hasPicoCamera && hasExtFuture;
-    // Note: XR_FB_passthrough blocks with PICO OS 5.15.7's OpenXR 1.1 loader;
-    // we render the live RGB camera feed directly via XR_PICO_camera_image instead.
-    const bool hasPassthroughExt = false;
     LOGI("Extensions: total=%u pico_camera=%d ext_future=%d",
          extCount, (int)hasPicoCamera, (int)hasExtFuture);
 
@@ -535,9 +500,6 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
     };
     if (hasExtFuture) {
         enabledExts.push_back(XR_EXT_FUTURE_EXTENSION_NAME);
-    }
-    if (hasPassthroughExt) {
-        enabledExts.push_back(XR_FB_PASSTHROUGH_EXTENSION_NAME);
     }
 
     // 3. Create XrInstance
@@ -586,6 +548,26 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
         LOGE("xrGetSystem failed: %d", (int)res);
         xrDestroyInstance(instance);
         return;
+    }
+
+    // 4b. Environment blend modes: ALPHA_BLEND lets the runtime composite its
+    //     own low-latency passthrough (same path as PICO's MR) behind our
+    //     transparent layer. This is the only way the real world is shown.
+    bool supportsAlphaBlend = false;
+    {
+        uint32_t modeCount = 0;
+        xrEnumerateEnvironmentBlendModes(instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                         0, &modeCount, nullptr);
+        std::vector<XrEnvironmentBlendMode> modes(modeCount);
+        if (modeCount > 0) {
+            xrEnumerateEnvironmentBlendModes(instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                             modeCount, &modeCount, modes.data());
+        }
+        for (auto m : modes) {
+            LOGI("Supported environment blend mode: %d", (int)m);
+            if (m == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) supportsAlphaBlend = true;
+        }
+        LOGI("ALPHA_BLEND passthrough supported: %d", (int)supportsAlphaBlend);
     }
 
     // 5. OpenGL ES requirements & EGL context
@@ -654,27 +636,7 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
     }
     LOGI("Step 7 done: worldSpace=%p (type=%d)", (void*)worldSpace, (int)spaceInfo.referenceSpaceType);
 
-    // 8. Optional XR_FB_passthrough (initialized once session begins)
-    XrPassthroughFB passthrough = XR_NULL_HANDLE;
-    XrPassthroughLayerFB passthroughLayer = XR_NULL_HANDLE;
-    bool passthroughTried = false;
-    PFN_xrCreatePassthroughFB pfnCreatePT = nullptr;
-    PFN_xrDestroyPassthroughFB pfnDestroyPT = nullptr;
-    PFN_xrPassthroughStartFB pfnStartPT = nullptr;
-    PFN_xrCreatePassthroughLayerFB pfnCreatePTLayer = nullptr;
-    PFN_xrDestroyPassthroughLayerFB pfnDestroyPTLayer = nullptr;
-    PFN_xrPassthroughLayerResumeFB pfnResumePTLayer = nullptr;
-
-    if (hasPassthroughExt) {
-        xrGetInstanceProcAddr(instance, "xrCreatePassthroughFB", reinterpret_cast<PFN_xrVoidFunction*>(&pfnCreatePT));
-        xrGetInstanceProcAddr(instance, "xrDestroyPassthroughFB", reinterpret_cast<PFN_xrVoidFunction*>(&pfnDestroyPT));
-        xrGetInstanceProcAddr(instance, "xrPassthroughStartFB", reinterpret_cast<PFN_xrVoidFunction*>(&pfnStartPT));
-        xrGetInstanceProcAddr(instance, "xrCreatePassthroughLayerFB", reinterpret_cast<PFN_xrVoidFunction*>(&pfnCreatePTLayer));
-        xrGetInstanceProcAddr(instance, "xrDestroyPassthroughLayerFB", reinterpret_cast<PFN_xrVoidFunction*>(&pfnDestroyPTLayer));
-        xrGetInstanceProcAddr(instance, "xrPassthroughLayerResumeFB", reinterpret_cast<PFN_xrVoidFunction*>(&pfnResumePTLayer));
-    }
-
-    // 9. Controller action (Trigger / Select click to open URL or re-copy)
+    // 8. Controller action (Trigger / Select click to open URL or re-copy)
     XrActionSet actionSet = XR_NULL_HANDLE;
     XrAction triggerAction = XR_NULL_HANDLE;
     {
@@ -706,7 +668,7 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
         }
     }
 
-    // 10. Views & Swapchains
+    // 9. Views & Swapchains
     uint32_t viewCount = 0;
     xrEnumerateViewConfigurationViews(instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &viewCount, nullptr);
     std::vector<XrViewConfigurationView> viewConfigs(viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
@@ -733,7 +695,7 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
                                    reinterpret_cast<XrSwapchainImageBaseHeader*>(swapchainImages[i].data()));
     }
 
-    // 11. GL resources (FBO, quad VAO, shader, textures)
+    // 10. GL resources (FBO, quad VAO, shader, HUD texture)
     GLuint fbo = 0;
     glGenFramebuffers(1, &fbo);
     GLuint program = CreateQuadProgram();
@@ -741,9 +703,6 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
     GLint locTex = glGetUniformLocation(program, "uTex");
     GLint locMode = glGetUniformLocation(program, "uMode");
     GLint locDetected = glGetUniformLocation(program, "uDetected");
-    GLint locDispTan = glGetUniformLocation(program, "uDispTan");
-    GLint locCamFocal = glGetUniformLocation(program, "uCamFocal");
-    GLint locCamSize = glGetUniformLocation(program, "uCamSize");
 
     const float quadVerts[] = {
         -0.5f, -0.5f, 0.0f, 1.0f,
@@ -765,24 +724,7 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
     glBindVertexArray(0);
 
-    GLuint camTexL = 0, camTexR = 0, hudTex = 0;
-    glGenTextures(1, &camTexL);
-    glBindTexture(GL_TEXTURE_2D, camTexL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    uint32_t darkPx = 0xFF202020;
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &darkPx);
-
-    glGenTextures(1, &camTexR);
-    glBindTexture(GL_TEXTURE_2D, camTexR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &darkPx);
-
+    GLuint hudTex = 0;
     glGenTextures(1, &hudTex);
     glBindTexture(GL_TEXTURE_2D, hudTex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -794,19 +736,12 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
 
     const int kHudW = 1024;
     const int kHudH = 320;
-    uint32_t camTexW_L = 0, camTexH_L = 0;
-    uint32_t camTexW_R = 0, camTexH_R = 0;
-    bool rightFrameSeen = false;
-    XrTime lastCaptureL = 0;
-    XrTime lastCaptureR = 0;
 
-    // 12. PICO Camera (stereo pair) + QR Decoder worker
-    PicoCamera picoCamL;
-    PicoCamera picoCamR;
-    bool camFnsLoadedL = cameraExtEnabled && picoCamL.LoadFunctions(instance);
-    bool camFnsLoadedR = cameraExtEnabled && picoCamR.LoadFunctions(instance);
-    LOGI("Step 12 done: entering main loop (camFnsLoaded L=%d R=%d)",
-         (int)camFnsLoadedL, (int)camFnsLoadedR);
+    // 11. PICO Camera (left RGB, used only for QR decoding) + QR Decoder worker
+    PicoCamera picoCam;
+    bool camFnsLoaded = cameraExtEnabled && picoCam.LoadFunctions(instance);
+    LOGI("Step 11 done: entering main loop (camFnsLoaded=%d alphaBlend=%d)",
+         (int)camFnsLoaded, (int)supportsAlphaBlend);
     DecoderState decoderState;
     std::thread decoderThread(RunDecoderWorker, &decoderState);
 
@@ -814,24 +749,6 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
     std::string lastHudQr;
     bool lastHudDetected = false;
     auto lastDecodeSubmit = std::chrono::steady_clock::now();
-
-    auto uploadCameraTexture = [](GLuint tex, uint32_t& texWOut, uint32_t& texHOut,
-                                  const uint8_t* rgba, uint32_t w, uint32_t h,
-                                  uint32_t stride, uint32_t bpp) {
-        if (bpp != 4) return;
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(stride / bpp));
-        if (w != texWOut || h != texHOut) {
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)w, (GLsizei)h, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-            texWOut = w;
-            texHOut = h;
-        } else {
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h,
-                            GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-        }
-        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-    };
 
     bool sessionBegun = false;
     bool exitLoop = false;
@@ -869,8 +786,7 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
                         sessionBegun = true;
                     }
                 } else if (sessionState == XR_SESSION_STATE_STOPPING) {
-                    picoCamL.Shutdown();
-                    picoCamR.Shutdown();
+                    picoCam.Shutdown();
                     if (sessionBegun) {
                         xrEndSession(session);
                         sessionBegun = false;
@@ -888,39 +804,13 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
             continue;
         }
 
-        // Start passthrough & camera once session is VISIBLE/FOCUSED
-        if ((sessionState == XR_SESSION_STATE_VISIBLE || sessionState == XR_SESSION_STATE_FOCUSED) &&
-            !passthroughTried && hasPassthroughExt &&
-            pfnCreatePT && pfnStartPT && pfnCreatePTLayer && pfnResumePTLayer) {
-            passthroughTried = true;
-            XrPassthroughCreateInfoFB ptInfo{XR_TYPE_PASSTHROUGH_CREATE_INFO_FB};
-            if (XR_SUCCEEDED(pfnCreatePT(session, &ptInfo, &passthrough))) {
-                pfnStartPT(passthrough);
-                XrPassthroughLayerCreateInfoFB layerInfo{XR_TYPE_PASSTHROUGH_LAYER_CREATE_INFO_FB};
-                layerInfo.passthrough = passthrough;
-                layerInfo.purpose = XR_PASSTHROUGH_LAYER_PURPOSE_RECONSTRUCTION_FB;
-                layerInfo.flags = XR_PASSTHROUGH_IS_RUNNING_AT_CREATION_BIT_FB;
-                if (XR_SUCCEEDED(pfnCreatePTLayer(session, &layerInfo, &passthroughLayer))) {
-                    pfnResumePTLayer(passthroughLayer);
-                    LOGI("XR_FB_passthrough started");
-                }
-            }
-        }
-
-        // Start camera(s) once session is VISIBLE/FOCUSED and CAMERA permission is granted.
-        // Start the left camera first, then bring up the right one so the two
-        // async device/session creations do not race each other.
+        // Start the camera once session is VISIBLE/FOCUSED and CAMERA permission is granted.
         const bool sessionVisible = (sessionState == XR_SESSION_STATE_VISIBLE ||
                                      sessionState == XR_SESSION_STATE_FOCUSED);
         if (sessionVisible && (gCameraPermGranted.load() || bridge.HasCameraPermission())) {
             gCameraPermGranted.store(true);
-            if (camFnsLoadedL && picoCamL.GetState() == PicoCamera::State::Idle) {
-                picoCamL.Start(instance, session, 1);  // RGB left
-            }
-            const bool leftSettled = picoCamL.GetState() == PicoCamera::State::Capturing ||
-                                     picoCamL.GetState() == PicoCamera::State::Error;
-            if (camFnsLoadedR && picoCamR.GetState() == PicoCamera::State::Idle && leftSettled) {
-                picoCamR.Start(instance, session, 2);  // RGB right
+            if (camFnsLoaded && picoCam.GetState() == PicoCamera::State::Idle) {
+                picoCam.Start(instance, session, 1);  // RGB left
             }
         }
 
@@ -955,20 +845,27 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
             }
         }
 
-        // Update cameras & upload textures; the left camera also feeds the QR decoder
-        if (camFnsLoadedL && picoCamL.GetState() != PicoCamera::State::Idle) {
-            static bool loggedFirstFrameL = false;
-            picoCamL.Update([&](const uint8_t* rgba, uint32_t w, uint32_t h, uint32_t stride, uint32_t bpp, XrTime captureTime) {
-                if (captureTime > 0) lastCaptureL = captureTime;
-                if (!loggedFirstFrameL) {
-                    loggedFirstFrameL = true;
+        // Wait for the frame first, so the camera image acquired below is as
+        // fresh as possible for decoding.
+        XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
+        XrFrameState frameState{XR_TYPE_FRAME_STATE};
+        if (XR_FAILED(xrWaitFrame(session, &waitInfo, &frameState))) {
+            continue;
+        }
+
+        // Pull the latest camera frame and feed the QR decoder
+        if (camFnsLoaded && picoCam.GetState() != PicoCamera::State::Idle) {
+            static bool loggedFirstFrame = false;
+            picoCam.Update([&](const uint8_t* rgba, uint32_t w, uint32_t h, uint32_t stride, uint32_t bpp, XrTime) {
+                if (bpp != 4) return;
+                if (!loggedFirstFrame) {
+                    loggedFirstFrame = true;
                     const uint8_t* mid = rgba + (size_t)(h / 2) * stride + (size_t)(w / 2) * 4;
-                    LOGI("First LEFT camera frame: %ux%u stride=%u bpp=%u centerRGBA=(%u,%u,%u,%u)",
+                    LOGI("First camera frame: %ux%u stride=%u bpp=%u centerRGBA=(%u,%u,%u,%u)",
                          w, h, stride, bpp, mid[0], mid[1], mid[2], mid[3]);
                 }
-                uploadCameraTexture(camTexL, camTexW_L, camTexH_L, rgba, w, h, stride, bpp);
 
-                // Throttle QR decode to ~8 Hz (left camera only)
+                // Throttle QR decode to ~8 Hz
                 auto now = std::chrono::steady_clock::now();
                 if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastDecodeSubmit).count() >= 120) {
                     std::lock_guard<std::mutex> lk(decoderState.mtx);
@@ -994,29 +891,6 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
             });
         }
 
-        // Right camera upload only (displayed to the right eye)
-        if (camFnsLoadedR && picoCamR.GetState() != PicoCamera::State::Idle) {
-            static bool loggedFirstFrameR = false;
-            picoCamR.Update([&](const uint8_t* rgba, uint32_t w, uint32_t h, uint32_t stride, uint32_t bpp, XrTime captureTime) {
-                if (captureTime > 0) lastCaptureR = captureTime;
-                if (!loggedFirstFrameR) {
-                    loggedFirstFrameR = true;
-                    const uint8_t* mid = rgba + (size_t)(h / 2) * stride + (size_t)(w / 2) * 4;
-                    LOGI("First RIGHT camera frame: %ux%u stride=%u bpp=%u centerRGBA=(%u,%u,%u,%u)",
-                         w, h, stride, bpp, mid[0], mid[1], mid[2], mid[3]);
-                }
-                uploadCameraTexture(camTexR, camTexW_R, camTexH_R, rgba, w, h, stride, bpp);
-                if (w > 0 && h > 0) rightFrameSeen = true;
-
-                static int syncLogs = 0;
-                if (syncLogs < 10 && lastCaptureL > 0 && lastCaptureR > 0) {
-                    syncLogs++;
-                    LOGI("Capture delta L-R = %.2f ms (L-R)",
-                         (double)(lastCaptureL - lastCaptureR) / 1e6);
-                }
-            });
-        }
-
         // Check decoded QR status & update HUD texture if changed
         std::string curStatus;
         if (!cameraExtEnabled) {
@@ -1024,12 +898,10 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
         } else if (!gCameraPermGranted.load()) {
             curStatus = "カメラ権限を許可してください";
         } else {
-            curStatus = picoCamL.GetStatusText();
-            if (picoCamR.GetState() == PicoCamera::State::Capturing && rightFrameSeen) {
-                curStatus += "  |  ステレオ (L/R)";
-            } else if (picoCamR.GetState() == PicoCamera::State::Error) {
-                curStatus += "  |  右カメラ未使用";
-            }
+            curStatus = picoCam.GetStatusText();
+        }
+        if (!supportsAlphaBlend) {
+            curStatus += "  |  パススルー非対応";
         }
 
         std::string curQr;
@@ -1065,13 +937,7 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
             lastHudDetected = recentlyDetected;
         }
 
-        // OpenXR Frame
-        XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
-        XrFrameState frameState{XR_TYPE_FRAME_STATE};
-        if (XR_FAILED(xrWaitFrame(session, &waitInfo, &frameState))) {
-            continue;
-        }
-
+        // OpenXR Frame (xrWaitFrame already done above)
         XrFrameBeginInfo beginFrameInfo{XR_TYPE_FRAME_BEGIN_INFO};
         xrBeginFrame(session, &beginFrameInfo);
 
@@ -1098,70 +964,6 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
                              views[0].fov.angleRight * 57.29578f,
                              views[0].fov.angleDown * 57.29578f,
                              views[0].fov.angleUp * 57.29578f);
-                    }
-                }
-
-                // ---- Map display rays into each camera image (pinhole reprojection) ----
-                const float kPi = 3.14159265358979f;
-                auto makeCameraMap = [&](const PicoCamera& cam, GLuint tex,
-                                         uint32_t texW, uint32_t texH) {
-                    CameraViewMap m;
-                    m.tex = tex;
-                    m.imgW = texW > 0 ? (float)texW
-                           : (cam.GetWidth() > 0 ? (float)cam.GetWidth() : 1280.0f);
-                    m.imgH = texH > 0 ? (float)texH
-                           : (cam.GetHeight() > 0 ? (float)cam.GetHeight() : 960.0f);
-
-                    const PicoCamera::Intrinsics& ci = cam.GetIntrinsics();
-                    bool valid = false;
-                    if (ci.valid) {
-                        const float kx = (texW > 0 && ci.width > 0)
-                                       ? (float)texW / (float)ci.width : 1.0f;
-                        const float ky = (texH > 0 && ci.height > 0)
-                                       ? (float)texH / (float)ci.height : 1.0f;
-                        m.fx = ci.fx * kx;
-                        m.fy = ci.fy * ky;
-                        m.cx = ci.cx * kx;
-                        m.cy = ci.cy * ky;
-                        if ((m.fx < 1.0f || m.fy < 1.0f) && ci.fovX > 0.0f && ci.fovY > 0.0f) {
-                            // Some runtimes only fill in the FOV (degrees).
-                            m.fx = m.imgW * 0.5f / std::tan(ci.fovX * kPi / 360.0f);
-                            m.fy = m.imgH * 0.5f / std::tan(ci.fovY * kPi / 360.0f);
-                        }
-                        if (m.cx <= 0.0f || m.cy <= 0.0f) {
-                            m.cx = m.imgW * 0.5f;
-                            m.cy = m.imgH * 0.5f;
-                        }
-                        valid = m.fx > 1.0f && m.fy > 1.0f;
-                    }
-                    if (!valid) {
-                        // Fallback: ~100 deg horizontal pinhole, square pixels.
-                        const float hfov = 100.0f * kPi / 180.0f;
-                        m.fx = m.imgW * 0.5f / std::tan(hfov * 0.5f);
-                        m.fy = m.fx;
-                        m.cx = m.imgW * 0.5f;
-                        m.cy = m.imgH * 0.5f;
-                    }
-                    return m;
-                };
-
-                const CameraViewMap mapL = makeCameraMap(picoCamL, camTexL, camTexW_L, camTexH_L);
-                const CameraViewMap mapR = makeCameraMap(picoCamR, camTexR, camTexW_R, camTexH_R);
-                const bool stereoReady =
-                    rightFrameSeen && picoCamR.GetState() == PicoCamera::State::Capturing;
-
-                // Identify which view index is the right eye (view positions are
-                // in LOCAL space, +X = right).
-                uint32_t rightEyeView = 1;
-                if (outViews >= 2 && views[0].pose.position.x > views[1].pose.position.x) {
-                    rightEyeView = 0;
-                }
-                if (stereoReady) {
-                    static bool loggedStereo = false;
-                    if (!loggedStereo) {
-                        loggedStereo = true;
-                        LOGI("Stereo passthrough enabled: L map fx=%.1f R map fx=%.1f (rightView=%u)",
-                             mapL.fx, mapR.fx, rightEyeView);
                     }
                 }
 
@@ -1214,11 +1016,15 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
                                            swapchainImages[i][imgIdx].image, 0);
                     glViewport(0, 0, w, h);
                     glEnable(GL_BLEND);
-                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    // Keep destination alpha meaningful (premultiplied) so the
+                    // compositor can blend our layer over system passthrough.
+                    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                                        GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
                     glDisable(GL_DEPTH_TEST);
 
-                    // Transparent clear if passthrough is active, dark slate otherwise
-                    if (passthroughLayer != XR_NULL_HANDLE) {
+                    // Transparent clear so the system passthrough shows through
+                    // (dark slate if the runtime cannot do ALPHA_BLEND).
+                    if (supportsAlphaBlend) {
                         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
                     } else {
                         glClearColor(0.02f, 0.025f, 0.035f, 1.0f);
@@ -1234,21 +1040,9 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
                     glActiveTexture(GL_TEXTURE0);
                     glUniform1i(locTex, 0);
 
-                    // 1) Full-FOV camera feed, reprojected from the camera's
-                    //    pinhole intrinsics into this eye's display FOV.
-                    //    In stereo mode the right eye gets the right RGB camera.
-                    const bool useRightCamera = stereoReady && i == rightEyeView;
-                    const CameraViewMap& cm = useRightCamera ? mapR : mapL;
-                    glUniform4f(locDispTan,
-                                std::tan(views[i].fov.angleLeft),
-                                std::tan(views[i].fov.angleRight),
-                                std::tan(views[i].fov.angleDown),
-                                std::tan(views[i].fov.angleUp));
-                    glUniform4f(locCamFocal, cm.fx, cm.fy, cm.cx, cm.cy);
-                    glUniform2f(locCamSize, cm.imgW, cm.imgH);
+                    // 1) Aiming reticle at the center of view
                     glUniform1f(locDetected, recentlyDetected ? 1.0f : 0.0f);
-                    glUniform1i(locMode, 2);
-                    glBindTexture(GL_TEXTURE_2D, cm.tex);
+                    glUniform1i(locMode, 1);
                     glDrawArrays(GL_TRIANGLES, 0, 6);
 
                     // 2) Floating HUD text panel (world space, damped follow)
@@ -1274,14 +1068,6 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
         }
 
         std::vector<const XrCompositionLayerBaseHeader*> layers;
-        XrCompositionLayerPassthroughFB ptCompLayer{XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB};
-        if (rendered && passthroughLayer != XR_NULL_HANDLE) {
-            ptCompLayer.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-            ptCompLayer.space = XR_NULL_HANDLE;
-            ptCompLayer.layerHandle = passthroughLayer;
-            layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&ptCompLayer));
-        }
-
         XrCompositionLayerProjection projLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         if (rendered) {
             projLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
@@ -1293,7 +1079,8 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
 
         XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
         endInfo.displayTime = frameState.predictedDisplayTime;
-        endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        endInfo.environmentBlendMode = supportsAlphaBlend ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+                                                          : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
         endInfo.layerCount = (uint32_t)layers.size();
         endInfo.layers = layers.empty() ? nullptr : layers.data();
         XrResult endRes = xrEndFrame(session, &endInfo);
@@ -1313,10 +1100,7 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
     }
     if (decoderThread.joinable()) decoderThread.join();
 
-    picoCamL.Shutdown();
-    picoCamR.Shutdown();
-    if (passthroughLayer != XR_NULL_HANDLE && pfnDestroyPTLayer) pfnDestroyPTLayer(passthroughLayer);
-    if (passthrough != XR_NULL_HANDLE && pfnDestroyPT) pfnDestroyPT(passthrough);
+    picoCam.Shutdown();
     for (auto sc : swapchains) {
         if (sc != XR_NULL_HANDLE) xrDestroySwapchain(sc);
     }
@@ -1325,8 +1109,6 @@ Java_dev_pico_qrreader_MainActivity_nativeMainLoop(JNIEnv* env, jobject thiz, jo
     if (session != XR_NULL_HANDLE) xrDestroySession(session);
     if (instance != XR_NULL_HANDLE) xrDestroyInstance(instance);
 
-    glDeleteTextures(1, &camTexL);
-    glDeleteTextures(1, &camTexR);
     glDeleteTextures(1, &hudTex);
     glDeleteProgram(program);
     glDeleteVertexArrays(1, &vao);

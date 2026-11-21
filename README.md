@@ -1,11 +1,11 @@
 # PICO QR Reader
 
-PICO 4 Ultra（PICO OS 5.15.0+）の OpenXR 拡張 **`XR_PICO_camera_image`** を使用し、外向きRGBパススルーカメラからリアルタイムにQRコードを読み取るネイティブXRアプリです。
+PICO 4 Ultra（PICO OS 5.15.0+）の OpenXR 拡張 **`XR_PICO_camera_image`** を使用し、外向きRGBカメラからリアルタイムにQRコードを読み取るネイティブXRアプリです。
 
 ## 特徴
 
 - **PICO 4 Ultra 外向きカラーカメラ対応**: `XR_PICO_camera_image` + `XR_EXT_future`（PICO OS 5.15.7 の OpenXR 1.1 ローダー）により、`config.disable_cameraservice=true` の環境でもリアルタイムに `1280x960` RGBA8888 映像を取得
-- **視界全体のカメラビュー + 両眼視差**: 左右RGBカメラ（id=1/2）を同時キャプチャできる環境では、左眼に左カメラ・右眼に右カメラの映像を割り当ててステレオ視差を再現。ピンホール内部パラメータ（焦点距離・主点・FOV）で表示FOVへ再投影する。2台目が使えない場合は自動でモノラル表示にフォールバック
+- **システムパススルー表示**: 背景の実世界は `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND` でランタイム標準のパススルー（PICO本体のMRと同じ経路）に任せ、アプリは透明レイヤーに照準とHUDだけを描画。カメラ映像は自前で描画しないため遅延はシステムと同等。カメラ（左RGB, id=1）はQRデコード専用
 - **フローティングHUD**: 読み取り状態と結果のパネルはワールド空間に浮遊し、視界中央下を目標に少し遅れて滑らかに追従
 - **オフライン高速QRデコード**: 軽量Cライブラリ [`quirc`](https://github.com/dlbeer/quirc) をバックグラウンドスレッドで実行（描画ループをブロックしない）
 - **自動クリップボードコピー & URLオープン**:
